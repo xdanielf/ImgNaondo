@@ -1,6 +1,8 @@
 # ImgNaondo
 
-A fast, pithy, while powerful Image Hosting designed for Cloudflare Workers.
+A fast, lean and powerful image hosting solution designed specifically for Cloudflare Workers.
 
-## Settings
-Create a 
+## Configuration
+Create a Workers project, an R2 storage bucket named ‘imgnaondo’ (with the binding name “IMAGES”), and an environment variable named ‘PASSWORD’ set to your password. Bind this to your Workers.
+
+Copy the code from workers.js and replace the existing code.
