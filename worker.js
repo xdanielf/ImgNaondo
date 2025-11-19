@@ -197,6 +197,8 @@ async function handleStats(request, env, corsHeaders) {
   let cursor;
   let totalSize = 0;
   let totalImages = 0;
+  let safetyLimit = 0;
+
   do {
     const listed = await env.IMAGES.list({ limit: 1000, include: ['customMetadata'], cursor });
     for (const obj of listed.objects) {
@@ -205,6 +207,8 @@ async function handleStats(request, env, corsHeaders) {
       totalImages += 1;
     }
     cursor = listed.truncated ? listed.cursor : undefined;
+    safetyLimit++;
+    if(safetyLimit > 3) break;
   } while (cursor);
 
   return new Response(JSON.stringify({
@@ -283,6 +287,8 @@ async function handleGetTags(request, env, corsHeaders) {
 
   let cursor;
   const tagCount = {};
+  let safetyLimit = 0;
+  
   do {
     const listed = await env.IMAGES.list({ limit: 1000, include: ['customMetadata'], cursor });
     for (const obj of listed.objects) {
@@ -296,6 +302,8 @@ async function handleGetTags(request, env, corsHeaders) {
       }
     }
     cursor = listed.truncated ? listed.cursor : undefined;
+    safetyLimit++;
+    if(safetyLimit > 3) break;
   } while (cursor);
 
   const tagList = Object.entries(tagCount)
@@ -422,7 +430,6 @@ function getHTML() {
     .copy-dropdown-menu button:hover {
       background: #f0f0f0;
     }
-
     .loader { text-align: center; padding: 16px; color: #666; }
   </style>
 </head>
@@ -521,19 +528,20 @@ function getHTML() {
     const SESSION_DURATION = 24 * 60 * 60 * 1000;
     const PAGE_SIZE = 50;
     const SCROLL_THRESHOLD = 300;
+    
     let password = '';
-    let allImages = [];
-    let allTags = [];
+    let fullLibrary = [];
+    let filteredLibrary = [];
+    let renderedCount = 0;
+    
     let selectedImages = new Set();
     let selectMode = false;
     let currentEditKey = '';
     let activeTag = null;
     let tagCloudExpanded = false;
-    let listCursor = null;
-    let hasMore = true;
-    let isLoading = false;
-    let filteredImages = [];
+    let isLoadingLibrary = false;
     let lightboxIndex = -1;
+
     function checkExistingLogin() {
       const storedPassword = localStorage.getItem(PASSWORD_KEY);
       const loginTime = localStorage.getItem(LOGIN_TIME_KEY);
@@ -547,12 +555,14 @@ function getHTML() {
         logout(false);
       }
     }
+
     function logout(reload = true) {
       localStorage.removeItem(PASSWORD_KEY);
       localStorage.removeItem(LOGIN_TIME_KEY);
       password = '';
       if (reload) location.reload();
     }
+
     async function login() {
       const inputPassword = document.getElementById('passwordInput').value;
       if (!inputPassword) return showToast('Please enter the password');
@@ -573,69 +583,225 @@ function getHTML() {
         showToast('Login failed: ' + error.message);
       }
     }
+
     async function loadData() {
-      await Promise.all([loadStats(), loadInitialGallery(), loadTags()]);
-    }
-    async function loadStats() {
-      try {
-        const res = await fetch('/api/stats', { headers: { 'Authorization': 'Bearer ' + password } });
-        const data = await res.json();
-        document.getElementById('totalImages').textContent = data.totalImages;
-        document.getElementById('totalSize').textContent = data.totalSizeMB + ' MB';
-      } catch (error) { console.error('Failed to load stats:', error); }
-    }
-    async function loadInitialGallery() {
-      allImages = [];
-      listCursor = null;
-      hasMore = true;
-      isLoading = false;
+      fullLibrary = [];
+      filteredLibrary = [];
+      renderedCount = 0;
       document.getElementById('gallery').innerHTML = '';
       document.getElementById('endMessage').classList.add('hidden');
-      await loadNextPage();
+      
+      loadStats();
+      await fetchFullLibrary();
     }
-    async function loadNextPage() {
-      if (!hasMore || isLoading) return;
-      isLoading = true;
+
+    async function fetchFullLibrary() {
+      if (isLoadingLibrary) return;
+      isLoadingLibrary = true;
       showBottomLoader(true);
+      
+      let cursor = null;
+      let hasMore = true;
+      let isFirstPage = true;
+
       try {
-        const qs = new URLSearchParams({ limit: String(PAGE_SIZE) });
-        if (listCursor) qs.set('cursor', listCursor);
-        const res = await fetch('/api/list?' + qs.toString(), {
-          headers: { 'Authorization': 'Bearer ' + password }
-        });
-        const data = await res.json();
-        const existed = new Set(allImages.map(i => i.key));
-        for (const img of data.images) {
-          if (!existed.has(img.key)) {
-            allImages.push(img);
+        while (hasMore) {
+          const qs = new URLSearchParams({ limit: '1000' });
+          if (cursor) qs.set('cursor', cursor);
+          
+          const res = await fetch('/api/list?' + qs.toString(), {
+            headers: { 'Authorization': 'Bearer ' + password }
+          });
+          
+          if (!res.ok) throw new Error('Failed to fetch list');
+          
+          const data = await res.json();
+          
+          const newItems = data.images.map(img => ({
+            ...img,
+            _searchStr: (img.customName + ' ' + img.originalName + ' ' + (img.tags||'')).toLowerCase()
+          }));
+          
+          fullLibrary.push(...newItems);
+          
+          if (isFirstPage) {
+            loadTags();
+            applyFilters();
+            isFirstPage = false;
+          } else {
+            updateStatsUI();
           }
+
+          cursor = data.cursor;
+          hasMore = data.truncated && !!cursor;
+          
+          if(hasMore) await new Promise(r => setTimeout(r, 50));
         }
-        listCursor = data.cursor;
-        hasMore = data.truncated && !!data.cursor;
-        applyFilters();
-        if (!hasMore) {
-          document.getElementById('endMessage').classList.remove('hidden');
+        
+        updateStatsUI();
+        if (fullLibrary.length > renderedCount) {
+             applyFilters(false);
         }
+        document.getElementById('endMessage').classList.remove('hidden');
+
       } catch (e) {
         console.error(e);
-        showToast('Failed to load more images');
+        showToast('Error loading image library');
       } finally {
-        isLoading = false;
+        isLoadingLibrary = false;
         showBottomLoader(false);
       }
     }
-    function showBottomLoader(show) {
-      const el = document.getElementById('infiniteLoader');
-      if (show) el.classList.remove('hidden'); else el.classList.add('hidden');
+
+    function applyFilters(resetRender = true) {
+      const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+      const sortBy = document.getElementById('sortSelect').value;
+
+      let temp = fullLibrary;
+      
+      if (activeTag) {
+        const tagSearch = activeTag.toLowerCase();
+        temp = temp.filter(img => (img.tags || '').toLowerCase().includes(tagSearch));
+      }
+
+      if (searchTerm) {
+        temp = temp.filter(img => img._searchStr.includes(searchTerm));
+      }
+
+      temp.sort((a, b) => {
+        switch (sortBy) {
+          case 'time-desc': return new Date(b.uploadTime) - new Date(a.uploadTime);
+          case 'time-asc': return new Date(a.uploadTime) - new Date(b.uploadTime);
+          case 'size-desc': return b.size - a.size;
+          case 'size-asc': return a.size - b.size;
+          case 'name-asc': return (a.customName || a.originalName).localeCompare(b.customName || b.originalName);
+          case 'name-desc': return (b.customName || b.originalName).localeCompare(a.customName || a.originalName);
+          default: return 0;
+        }
+      });
+
+      filteredLibrary = temp;
+      
+      if (resetRender) {
+        document.getElementById('gallery').innerHTML = '';
+        renderedCount = 0;
+        renderNextBatch();
+      }
+      
+      const totalSpan = document.getElementById('totalImages');
+      if (filteredLibrary.length !== fullLibrary.length) {
+        totalSpan.textContent = \`\${filteredLibrary.length} / \${fullLibrary.length}\`;
+      } else {
+        totalSpan.textContent = fullLibrary.length;
+      }
     }
+
+    function renderNextBatch() {
+      const gallery = document.getElementById('gallery');
+      
+      if (filteredLibrary.length === 0) {
+        gallery.innerHTML = '<div class="no-images">No images found.</div>';
+        return;
+      }
+
+      const start = renderedCount;
+      const end = Math.min(renderedCount + PAGE_SIZE, filteredLibrary.length);
+      
+      if (start >= end) return;
+
+      const fragment = document.createDocumentFragment();
+      
+      for (let i = start; i < end; i++) {
+        const img = filteredLibrary[i];
+        const card = document.createElement('div');
+        card.className = 'image-card' + (selectedImages.has(img.key) ? ' selected' : '');
+        
+        const displayName = img.customName || img.originalName;
+        const safeName = displayName.replace(/"/g, '&quot;');
+        const tagsHtml = img.tags ? img.tags.split(',').map(tag => \`<span class="image-tag">\${tag.trim()}</span>\`).join('') : '';
+        
+        card.innerHTML = \`
+          \${selectMode ? \`<input type="checkbox" class="checkbox" \${selectedImages.has(img.key) ? 'checked' : ''} onchange="toggleSelect('\${img.key}')">\` : ''}
+          <img src="\${img.url}" alt="\${safeName}" loading="lazy"
+               onclick="openLightbox('\${img.key}')"
+               onerror="this.src='data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI1MCIgaGVpZ2h0PSI1MCI+PHJlY3Qgd2lkdGg9IjUwIiBoZWlnaHQ9IjUwIiBmaWxsPSIjZWVlIi8+PC9zdmc+'">
+          <div class="image-info">
+            <div class="image-name" title="\${safeName}">\${displayName}</div>
+            <div class="image-meta">\${formatSize(img.size)} • \${new Date(img.uploadTime).toLocaleDateString()}</div>
+            \${tagsHtml ? \`<div class="image-tags">\${tagsHtml}</div>\` : ''}
+            <div class="image-actions">
+              <div class="copy-dropdown">
+                <button onclick="toggleCopyMenu(event)">Copy ▾</button>
+                <div class="copy-dropdown-menu" onclick="event.stopPropagation()">
+                  <button onclick="handleCopy('\${img.key}', 'url')">URL</button>
+                  <button onclick="handleCopy('\${img.key}', 'html')">HTML</button>
+                  <button onclick="handleCopy('\${img.key}', 'md')">Markdown</button>
+                </div>
+              </div>
+              <button onclick="openEdit('\${img.key}')">Edit</button>
+              <button class="btn-danger" onclick="deleteImage('\${img.key}')">Del</button>
+            </div>
+          </div>
+        \`;
+        fragment.appendChild(card);
+      }
+      
+      gallery.appendChild(fragment);
+      renderedCount = end;
+
+      if (renderedCount >= filteredLibrary.length) {
+        document.getElementById('infiniteLoader').classList.add('hidden');
+        document.getElementById('endMessage').classList.remove('hidden');
+      } else {
+        document.getElementById('infiniteLoader').classList.remove('hidden');
+        document.getElementById('endMessage').classList.add('hidden');
+      }
+    }
+
+    window.addEventListener('scroll', () => {
+      const scrollBottom = document.documentElement.scrollHeight - (window.scrollY + window.innerHeight);
+      if (scrollBottom < SCROLL_THRESHOLD) {
+        renderNextBatch();
+      }
+    });
+
+    function handleCopy(key, type) {
+       const img = fullLibrary.find(i => i.key === key);
+       if(img) {
+         const alt = img.customName || img.originalName;
+         copyInFormat(img.url, alt, type);
+       }
+       document.querySelectorAll('.copy-dropdown.open').forEach(el => el.classList.remove('open'));
+    }
+
+    async function loadStats() {
+    }
+    
+    function updateStatsUI() {
+        let totalSize = 0;
+        fullLibrary.forEach(img => totalSize += (img.size || 0));
+        document.getElementById('totalImages').textContent = fullLibrary.length;
+        document.getElementById('totalSize').textContent = (totalSize / (1024 * 1024)).toFixed(2) + ' MB';
+    }
+
     async function loadTags() {
-      try {
-        const res = await fetch('/api/tags', { headers: { 'Authorization': 'Bearer ' + password } });
-        const data = await res.json();
-        allTags = data.tags;
-        renderTagCloud();
-      } catch (error) { console.error('Failed to load tags:', error); }
+       const tagCounts = {};
+       fullLibrary.forEach(img => {
+           if(img.tags) {
+               img.tags.split(',').forEach(t => {
+                   const tag = t.trim();
+                   if(tag) tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+               });
+           }
+       });
+       
+       allTags = Object.entries(tagCounts)
+         .map(([tag, count]) => ({ tag, count }))
+         .sort((a, b) => b.count - a.count);
+       
+       renderTagCloud();
     }
+
     function renderTagCloud() {
       const container = document.getElementById('tagCloudContent');
       if (!allTags || allTags.length === 0) {
@@ -647,141 +813,153 @@ function getHTML() {
         return \`<div class="tag-item \${activeTag === tag ? 'active' : ''}" onclick="filterByTag('\${escapedTag}')">\${tag}<span class="tag-count">\${count}</span></div>\`;
       }).join('');
     }
-    function toggleTagCloud() {
-      tagCloudExpanded = !tagCloudExpanded;
-      const content = document.getElementById('tagCloudContent');
-      const btn = document.querySelector('.tag-cloud-toggle');
-      if (tagCloudExpanded) { content.classList.add('expanded'); btn.textContent = 'Collapse'; }
-      else { content.classList.remove('expanded'); btn.textContent = 'Expand'; }
-    }
+
     function filterByTag(tag) {
-      if (activeTag === tag) { activeTag = null; document.getElementById('searchInput').value = ''; }
-      else { activeTag = tag; document.getElementById('searchInput').value = tag; }
+      if (activeTag === tag) { 
+          activeTag = null; 
+          document.getElementById('searchInput').value = ''; 
+      } else { 
+          activeTag = tag; 
+          document.getElementById('searchInput').value = tag;
+      }
       renderTagCloud();
       applyFilters();
     }
-    function applyFilters() {
-      const searchTerm = document.getElementById('searchInput').value.toLowerCase();
-      const sortBy = document.getElementById('sortSelect').value;
-      let filtered = allImages.filter(img => {
-        const name = (img.customName || img.originalName).toLowerCase();
-        const tags = (img.tags || '').toLowerCase();
-        return name.includes(searchTerm) || tags.includes(searchTerm);
-      });
-      filtered.sort((a, b) => {
-        switch (sortBy) {
-          case 'time-desc': return new Date(b.uploadTime) - new Date(a.uploadTime);
-          case 'time-asc': return new Date(a.uploadTime) - new Date(b.uploadTime);
-          case 'size-desc': return b.size - a.size;
-          case 'size-asc': return a.size - b.size;
-          case 'name-asc': return (a.customName || a.originalName).localeCompare(b.customName || b.originalName);
-          case 'name-desc': return (b.customName || b.originalName).localeCompare(a.customName || a.originalName);
-          default: return 0;
-        }
-      });
-      filteredImages = filtered.slice();
-      renderGallery(filtered);
-    }
-    function renderGallery(images) {
-      const gallery = document.getElementById('gallery');
-      if (images.length === 0) {
-        gallery.innerHTML = '<div class="no-images">No images found.</div>';
-        return;
-      }
-      gallery.innerHTML = '';
-      images.forEach(img => {
-        const card = document.createElement('div');
-        card.className = 'image-card' + (selectedImages.has(img.key) ? ' selected' : '');
-        const displayName = img.customName || img.originalName;
-        const safeAlt = displayName.replace(/'/g, "\\'").replace(/"/g, '&quot;');
-        const tagsHtml = img.tags ? img.tags.split(',').map(tag => \`<span class="image-tag">\${tag.trim()}</span>\`).join('') : '';
-        card.innerHTML = \`
-          \${selectMode ? \`<input type="checkbox" class="checkbox" \${selectedImages.has(img.key) ? 'checked' : ''} onchange="toggleSelect('\${img.key}')">\` : ''}
-          <img src="\${img.url}" alt="\${displayName}" loading="lazy"
-               onclick="openLightbox('\${img.key}')"
-               onerror="this.src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22200%22 height=%22200%22%3E%3Crect fill=%22%23ddd%22 width=%22200%22 height=%22200%22/%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 fill=%22%23999%22%3ELoad failed%3C/text%3E%3C/svg%3E'">
-          <div class="image-info">
-            <div class="image-name" title="\${displayName}">\${displayName}</div>
-            <div class="image-meta">Size: \${formatSize(img.size)}</div>
-            <div class="image-meta">\${new Date(img.uploadTime).toLocaleString()}</div>
-            \${tagsHtml ? \`<div class="image-tags">\${tagsHtml}</div>\` : ''}
-            <div class="image-actions">
-              <div class="copy-dropdown">
-                <button onclick="toggleCopyMenu(event)">Copy ▾</button>
-                <div class="copy-dropdown-menu" onclick="event.stopPropagation()">
-                  <button onclick="copyInFormat('\${img.url}', '\${safeAlt}', 'url')">URL</button>
-                  <button onclick="copyInFormat('\${img.url}', '\${safeAlt}', 'html')">HTML &lt;img&gt;</button>
-                  <button onclick="copyInFormat('\${img.url}', '\${safeAlt}', 'md')">Markdown</button>
-                  <button onclick="copyInFormat('\${img.url}', '\${safeAlt}', 'bb')">BBCode</button>
-                </div>
-              </div>
-              <button onclick="openEdit('\${img.key}')">Edit</button>
-              <button class="btn-danger" onclick="deleteImage('\${img.key}')">Delete</button>
-            </div>
-          </div>
-        \`;
-        gallery.appendChild(card);
-      });
-    }
+
     function handleFileSelect(files) { if (files.length > 0) uploadFiles(files); }
+
     async function uploadFiles(files) {
       const customName = document.getElementById('uploadCustomName').value.trim();
       const tags = document.getElementById('uploadTags').value.trim();
       const uploadButton = document.querySelector('#uploadArea button');
       const uploadProgress = document.getElementById('uploadProgress');
-      const uploadInputs = document.querySelectorAll('.upload-inputs input');
-      let successCount = 0, failCount = 0;
+      
+      uploadButton.disabled = true; 
+      
+      let successCount = 0;
+      
       try {
-        uploadButton.disabled = true; uploadButton.textContent = 'Uploading...';
-        uploadInputs.forEach(input => input.disabled = true);
         for (let i = 0; i < files.length; i++) {
           const file = files[i];
-          uploadProgress.textContent = \`Uploading \${i + 1} of \${files.length}: \${file.name}\`;
+          uploadProgress.textContent = \`Uploading \${i + 1} of \${files.length}...\`;
           const formData = new FormData();
           formData.append('file', file);
           if (customName) formData.append('customName', files.length > 1 ? \`\${customName}_\${i + 1}\` : customName);
           if (tags) formData.append('tags', tags);
-          try {
-            const res = await fetch('/api/upload', {
-              method: 'POST', headers: { 'Authorization': 'Bearer ' + password }, body: formData
-            });
-            const data = await res.json();
-            if (data.success) successCount++; else { failCount++; console.error('Upload failed:', data.error); }
-          } catch (error) { failCount++; console.error('Upload exception:', error); }
+
+          const res = await fetch('/api/upload', {
+             method: 'POST', headers: { 'Authorization': 'Bearer ' + password }, body: formData
+          });
+          const data = await res.json();
+          
+          if (data.success) {
+             successCount++;
+             const newImage = {
+                 key: data.filename,
+                 url: data.url,
+                 size: data.size,
+                 uploadTime: new Date().toISOString(),
+                 originalName: file.name,
+                 customName: data.customName,
+                 tags: data.tags,
+                 _searchStr: (data.customName + ' ' + file.name + ' ' + data.tags).toLowerCase()
+             };
+             fullLibrary.unshift(newImage);
+          }
         }
-      } finally {
-        uploadButton.disabled = false; uploadButton.textContent = 'Select Files';
-        uploadProgress.textContent = '';
-        uploadInputs.forEach(input => input.disabled = false);
+      } catch(e) { console.error(e); }
+      finally {
+          uploadButton.disabled = false;
+          uploadProgress.textContent = '';
+          document.getElementById('uploadCustomName').value = '';
+          document.getElementById('uploadTags').value = '';
+          document.getElementById('fileInput').value = '';
       }
-      if (successCount > 0) showToast(\`✓ Successfully uploaded \${successCount} image(s)\`);
-      if (failCount > 0) showToast(\`✗ \${failCount} image(s) failed to upload\`);
-      document.getElementById('uploadCustomName').value = '';
-      document.getElementById('uploadTags').value = '';
-      document.getElementById('fileInput').value = '';
-      await loadInitialGallery();
-      await loadStats();
-      await loadTags();
+      
+      if (successCount > 0) {
+          showToast(\`Uploaded \${successCount} images\`);
+          loadTags();
+          applyFilters();
+          updateStatsUI();
+      }
     }
+
     async function deleteImage(key) {
-      if (!confirm('Are you sure you want to delete this image?')) return;
+      if (!confirm('Delete this image?')) return;
       try {
         const res = await fetch(\`/api/delete/\${key}\`, {
           method: 'DELETE', headers: { 'Authorization': 'Bearer ' + password }
         });
         if (res.ok) {
-          showToast('Image deleted successfully');
-          allImages = allImages.filter(i => i.key !== key);
+          fullLibrary = fullLibrary.filter(i => i.key !== key);
           selectedImages.delete(key);
-          document.getElementById('selectedCount').textContent = \`Selected: \${selectedImages.size}\`;
-          applyFilters();
-        } else {
-          showToast('Failed to delete image');
+          
+          showToast('Deleted');
+          loadTags();
+          applyFilters(false);
+          applyFilters(true);
+          updateStatsUI();
         }
-      } catch (error) {
-        showToast('Error deleting image: ' + error.message);
-      }
+      } catch (e) { showToast(e.message); }
     }
+    
+    async function batchDelete() {
+        if (!selectMode || selectedImages.size === 0) return showToast('No images selected');
+        if (!confirm(\`Delete \${selectedImages.size} images?\`)) return;
+        
+        const keys = Array.from(selectedImages);
+        
+        try {
+            const res = await fetch('/api/batch-delete', {
+                method: 'POST',
+                headers: {'Authorization': 'Bearer ' + password, 'Content-Type': 'application/json'},
+                body: JSON.stringify({ filenames: keys })
+            });
+            if(res.ok) {
+                const delSet = new Set(keys);
+                fullLibrary = fullLibrary.filter(i => !delSet.has(i.key));
+                selectedImages.clear();
+                document.getElementById('selectedCount').textContent = 'Selected: 0';
+                
+                showToast('Batch delete successful');
+                loadTags();
+                applyFilters();
+                updateStatsUI();
+            }
+        } catch(e) { showToast('Batch delete failed'); }
+    }
+
+    async function saveEdit() {
+      const customName = document.getElementById('editCustomName').value.trim();
+      const tags = document.getElementById('editTags').value.trim();
+      
+      try {
+        const res = await fetch('/api/rename', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + password, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename: currentEditKey, customName, tags })
+        });
+        if (res.ok) {
+           const item = fullLibrary.find(i => i.key === currentEditKey);
+           if (item) {
+               item.customName = customName;
+               item.tags = tags;
+               item._searchStr = (item.customName + ' ' + item.originalName + ' ' + item.tags).toLowerCase();
+           }
+           closeEditModal();
+           showToast('Saved');
+           loadTags();
+           applyFilters(false);
+           applyFilters();
+        }
+      } catch(e) { showToast(e.message); }
+    }
+
+    function showBottomLoader(show) {
+      const el = document.getElementById('infiniteLoader');
+      if (show) el.classList.remove('hidden'); else el.classList.add('hidden');
+    }
+    
     function toggleSelectMode() {
       selectMode = !selectMode;
       if (!selectMode) {
@@ -791,26 +969,39 @@ function getHTML() {
       } else {
         document.getElementById('bulkActions').classList.add('show');
       }
-      applyFilters();
+      document.getElementById('gallery').innerHTML = '';
+      renderedCount = 0;
+      renderNextBatch();
     }
+
     function toggleSelect(key) {
       if (selectedImages.has(key)) selectedImages.delete(key);
       else selectedImages.add(key);
       document.getElementById('selectedCount').textContent = \`Selected: \${selectedImages.size}\`;
-      applyFilters();
     }
+    
     function selectAll() {
-      allImages.forEach(img => selectedImages.add(img.key));
+      filteredLibrary.forEach(img => selectedImages.add(img.key));
       document.getElementById('selectedCount').textContent = \`Selected: \${selectedImages.size}\`;
-      applyFilters();
+      const scroll = window.scrollY;
+      document.getElementById('gallery').innerHTML = '';
+      renderedCount = 0;
+      renderNextBatch();
+      window.scrollTo(0, scroll);
     }
+    
     function deselectAll() {
       selectedImages.clear();
       document.getElementById('selectedCount').textContent = 'Selected: 0';
-      applyFilters();
+      const scroll = window.scrollY;
+      document.getElementById('gallery').innerHTML = '';
+      renderedCount = 0;
+      renderNextBatch();
+      window.scrollTo(0, scroll);
     }
+
     function openEdit(key) {
-      const img = allImages.find(i => i.key === key);
+      const img = fullLibrary.find(i => i.key === key);
       if (!img) return;
       currentEditKey = key;
       document.getElementById('editCustomName').value = img.customName || '';
@@ -819,169 +1010,99 @@ function getHTML() {
       document.getElementById('editModal').classList.add('show');
     }
     function closeEditModal() { document.getElementById('editModal').classList.remove('show'); }
-    async function saveEdit() {
-      const customName = document.getElementById('editCustomName').value.trim();
-      const tags = document.getElementById('editTags').value.trim();
-      try {
-        const res = await fetch('/api/rename', {
-          method: 'POST',
-          headers: { 'Authorization': 'Bearer ' + password, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filename: currentEditKey, customName, tags })
-        });
-        if (res.ok) {
-          showToast('Saved successfully');
-          const idx = allImages.findIndex(i => i.key === currentEditKey);
-          if (idx >= 0) { allImages[idx].customName = customName; allImages[idx].tags = tags; }
-          closeEditModal();
-          applyFilters();
-        } else {
-          const data = await res.json();
-          showToast('Save failed: ' + (data.error || 'Unknown error'));
-        }
-      } catch (error) {
-        showToast('Save failed: ' + error.message);
-      }
+    
+    function openLightbox(key) {
+      lightboxIndex = filteredLibrary.findIndex(i => i.key === key);
+      if (lightboxIndex < 0) return;
+      updateLightbox();
+      document.getElementById('lightbox').classList.add('show');
     }
-    async function attemptCopy(text) {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(text);
-        return;
-      }
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      ta.setAttribute('readonly', '');
-      ta.style.position = 'fixed';
-      ta.style.left = '-9999px';
-      ta.style.top = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      ta.setSelectionRange(0, ta.value.length);
-      const ok = document.execCommand('copy');
-      document.body.removeChild(ta);
-      if (!ok) throw new Error('execCommand copy failed');
+    function updateLightbox() {
+      const img = filteredLibrary[lightboxIndex];
+      if (!img) return;
+      const el = document.getElementById('lightboxImg');
+      el.src = img.url;
+      el.alt = img.customName || img.originalName;
     }
-    function buildCopyText(url, alt, fmt) {
-      switch (fmt) {
-        case 'url': return url;
-        case 'html': return \`<img src="\${url}" alt="\${alt}">\`;
-        case 'md': return \`![\${alt}](\${url})\`;
-        case 'bb': return \`[img]\${url}[/img]\`;
-        default: return url;
-      }
+    function prevImage(e) { e && e.stopPropagation(); if (lightboxIndex > 0) { lightboxIndex--; updateLightbox(); } }
+    function nextImage(e) { e && e.stopPropagation(); if (lightboxIndex < filteredLibrary.length - 1) { lightboxIndex++; updateLightbox(); } }
+    function closeLightbox() { document.getElementById('lightbox').classList.remove('show'); }
+
+    function toggleTagCloud() {
+      tagCloudExpanded = !tagCloudExpanded;
+      const content = document.getElementById('tagCloudContent');
+      const btn = document.querySelector('.tag-cloud-toggle');
+      if (tagCloudExpanded) { content.classList.add('expanded'); btn.textContent = 'Collapse'; }
+      else { content.classList.remove('expanded'); btn.textContent = 'Expand'; }
     }
-    async function copyInFormat(url, alt, fmt) {
-      const text = buildCopyText(url, alt, fmt);
-      try { await attemptCopy(text); showToast('✓ Copied'); }
-      catch (e) { console.error(e); showToast('✗ Copy failed'); }
-      finally { document.querySelectorAll('.copy-dropdown.open').forEach(el => el.classList.remove('open')); }
+    
+    function showToast(msg) {
+      const t = document.createElement('div'); t.className='toast'; t.textContent=msg;
+      document.body.appendChild(t); setTimeout(()=>t.remove(), 2500);
     }
+    
     function toggleCopyMenu(e) {
       e.stopPropagation();
       const wrap = e.target.closest('.copy-dropdown');
       document.querySelectorAll('.copy-dropdown.open').forEach(el => { if (el !== wrap) el.classList.remove('open'); });
       wrap.classList.toggle('open');
     }
-    async function copyUrl(url) {
-      try { await attemptCopy(url); showToast('✓ Link copied to clipboard'); }
-      catch { showToast('✗ Failed to copy link'); }
+    
+    async function attemptCopy(text) {
+      if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return; }
+      const ta = document.createElement('textarea'); ta.value = text; ta.style.position='fixed'; ta.style.left='-9999px';
+      document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
     }
+    
+    function buildCopyText(url, alt, fmt) {
+      switch (fmt) {
+        case 'url': return url;
+        case 'html': return \`<img src="\${url}" alt="\${alt}">\`;
+        case 'md': return \`![\${alt}](\${url})\`;
+        default: return url;
+      }
+    }
+    async function copyInFormat(url, alt, fmt) {
+      try { await attemptCopy(buildCopyText(url, alt, fmt)); showToast('✓ Copied'); }
+      catch (e) { showToast('✗ Copy failed'); }
+    }
+    
     function formatSize(bytes) {
       if (bytes < 1024) return bytes + ' B';
       if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
       return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
     }
-    function showToast(message) {
-      const toast = document.createElement('div');
-      toast.className = 'toast';
-      toast.textContent = message;
-      document.body.appendChild(toast);
-      setTimeout(() => toast.remove(), 2500);
-    }
-    function openLightbox(key) {
-      lightboxIndex = filteredImages.findIndex(i => i.key === key);
-      if (lightboxIndex < 0) return;
-      updateLightbox();
-      document.getElementById('lightbox').classList.add('show');
-    }
-    function updateLightbox() {
-      const img = filteredImages[lightboxIndex];
-      if (!img) return;
-      const el = document.getElementById('lightboxImg');
-      el.src = img.url;
-      el.alt = img.customName || img.originalName;
-    }
-    function closeLightbox() { document.getElementById('lightbox').classList.remove('show'); }
-    function prevImage(e) { e && e.stopPropagation(); if (lightboxIndex > 0) { lightboxIndex--; updateLightbox(); } }
-    function nextImage(e) { e && e.stopPropagation(); if (lightboxIndex < filteredImages.length - 1) { lightboxIndex++; updateLightbox(); } }
-    async function batchDelete() {
-      if (!selectMode) {
-        showToast('Please enable Bulk Select first');
-        return;
-      }
-      const keys = Array.from(selectedImages);
-      if (keys.length === 0) {
-        showToast('Please select images first');
-        return;
-      }
-      if (!confirm(\`Are you sure you want to delete \${keys.length} image(s)?\`)) return;
-      const bulkWrap = document.getElementById('bulkActions');
-      const delBtn = bulkWrap.querySelector('.btn-danger');
-      const oldText = delBtn.textContent;
-      delBtn.disabled = true;
-      delBtn.textContent = 'Deleting...';
-      try {
-        const res = await fetch('/api/batch-delete', {
-          method: 'POST',
-          headers: {
-            'Authorization': 'Bearer ' + password,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ filenames: keys })
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.error || 'Request failed');
-        const delSet = new Set(keys);
-        allImages = allImages.filter(img => !delSet.has(img.key));
-        selectedImages.clear();
-        document.getElementById('selectedCount').textContent = 'Selected: 0';
+
+    document.addEventListener('click', () => document.querySelectorAll('.copy-dropdown.open').forEach(el => el.classList.remove('open')));
+    
+    document.getElementById('searchInput').addEventListener('input', () => {
         applyFilters();
-        showToast(\`Successfully deleted \${keys.length} image(s)\`);
-      } catch (e) {
-        console.error(e);
-        showToast('Failed to delete images: ' + e.message);
-      } finally {
-        delBtn.disabled = false;
-        delBtn.textContent = oldText;
-      }
-    }
-    document.addEventListener('click', () => {
-      document.querySelectorAll('.copy-dropdown.open').forEach(el => el.classList.remove('open'));
     });
+    
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { closeEditModal(); closeLightbox(); }
+      else if (document.getElementById('lightbox').classList.contains('show')) {
+        if (e.key === 'ArrowLeft') prevImage();
+        if (e.key === 'ArrowRight') nextImage();
+      }
+    });
+    
     window.addEventListener('paste', async (e) => {
       const items = e.clipboardData && e.clipboardData.items;
       if (!items || !items.length) return;
       const files = [];
+      const mimeToExt = {'image/jpeg':'jpg','image/png':'png','image/gif':'gif','image/webp':'webp','image/bmp':'bmp','image/svg+xml':'svg'};
       for (const it of items) {
         if (it.type && it.type.startsWith('image/')) {
           const blob = it.getAsFile();
-          const name = \`pasted_\${Date.now()}.\${(blob.type.split('/')[1] || 'png')}\`;
-          files.push(new File([blob], name, { type: blob.type || 'image/png' }));
+          const ext = mimeToExt[blob.type] || blob.type.split('/')[1] || 'png';
+          files.push(new File([blob], \`pasted_\${Date.now()}.\${ext}\`, { type: blob.type }));
         }
       }
-      if (!files.length) return;
-      if (!password) { showToast('Please login first'); return; }
-      showToast(\`Uploading \${files.length} pasted image(s)...\`);
-      await uploadFiles(files);
+      if (files.length && password) uploadFiles(files);
+      else if (files.length) showToast('Please login first');
     });
-    window.addEventListener('scroll', () => {
-      if (!hasMore || isLoading) return;
-      const scrollBottom = document.documentElement.scrollHeight - (window.scrollY + window.innerHeight);
-      if (scrollBottom < SCROLL_THRESHOLD) loadNextPage();
-    });
-    document.addEventListener('DOMContentLoaded', () => {
-      checkExistingLogin();
-      document.getElementById('currentYear').textContent = new Date().getFullYear();
-    });
+
     const uploadArea = document.getElementById('uploadArea');
     uploadArea.addEventListener('dragover', (e) => { e.preventDefault(); uploadArea.classList.add('dragging'); });
     uploadArea.addEventListener('dragleave', (e) => { if (e.target === uploadArea) uploadArea.classList.remove('dragging'); });
@@ -990,18 +1111,10 @@ function getHTML() {
       const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/'));
       if (files.length > 0) uploadFiles(files);
     });
-    document.getElementById('searchInput').addEventListener('input', () => {
-      activeTag = null; renderTagCloud(); applyFilters();
-    });
-    document.addEventListener('keydown', (e) => {
-      const editOpen = document.getElementById('editModal').classList.contains('show');
-      const lightboxOpen = document.getElementById('lightbox').classList.contains('show');
-      if (e.key === 'Escape') { if (editOpen) closeEditModal(); if (lightboxOpen) closeLightbox(); }
-      else if (lightboxOpen && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
-        e.preventDefault();
-        if (e.key === 'ArrowLeft') prevImage();
-        if (e.key === 'ArrowRight') nextImage();
-      }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      checkExistingLogin();
+      document.getElementById('currentYear').textContent = new Date().getFullYear();
     });
   </script>
 </body>
