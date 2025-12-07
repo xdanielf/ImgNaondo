@@ -132,7 +132,7 @@ async function handleList(request, env, corsHeaders) {
   }
 
   const url = new URL(request.url);
-  const limit = parseInt(url.searchParams.get('limit') || '1000');
+  const limit = parseInt(url.searchParams.get('limit') || '50');
   const cursor = url.searchParams.get('cursor') || undefined;
 
   const options = { limit, include: ['customMetadata'] };
@@ -208,7 +208,7 @@ async function handleStats(request, env, corsHeaders) {
     }
     cursor = listed.truncated ? listed.cursor : undefined;
     safetyLimit++;
-    if(safetyLimit > 3) break;
+    if(safetyLimit > 5) break;
   } while (cursor);
 
   return new Response(JSON.stringify({
@@ -235,7 +235,7 @@ async function handleRename(request, env, corsHeaders) {
 
   const oldMetadata = object.customMetadata || {};
   const normalizedTags = tags ? tags.split(',').map(t => t.trim()).filter(Boolean).join(',') : '';
-  
+   
   await env.IMAGES.put(filename, object.body, {
     httpMetadata: object.httpMetadata,
     customMetadata: {
@@ -288,7 +288,7 @@ async function handleGetTags(request, env, corsHeaders) {
   let cursor;
   const tagCount = {};
   let safetyLimit = 0;
-  
+   
   do {
     const listed = await env.IMAGES.list({ limit: 1000, include: ['customMetadata'], cursor });
     for (const obj of listed.objects) {
@@ -303,7 +303,7 @@ async function handleGetTags(request, env, corsHeaders) {
     }
     cursor = listed.truncated ? listed.cursor : undefined;
     safetyLimit++;
-    if(safetyLimit > 3) break;
+    if(safetyLimit > 5) break;
   } while (cursor);
 
   const tagList = Object.entries(tagCount)
@@ -376,6 +376,7 @@ function getHTML() {
     .modal-content h3 { margin-bottom: 15px; }
     .form-group { margin-bottom: 15px; }
     .form-group label { display: block; margin-bottom: 5px; font-weight: 500; font-size: 14px; }
+    .form-group input { width: 100%; }
     .toast { position: fixed; bottom: 20px; right: 20px; background: #333; color: white; padding: 12px 20px; border-radius: 4px; font-size: 14px; z-index: 2000; animation: slideIn 0.3s; }
     @keyframes slideIn { from { transform: translateX(400px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
     .hidden { display: none !important; }
@@ -544,9 +545,8 @@ function getHTML() {
     const LOGIN_TIME_KEY = 'imgnaondo_login_time';
     const LANG_KEY = 'imgnaondo_lang';
     const SESSION_DURATION = 24 * 60 * 60 * 1000;
-    const PAGE_SIZE = 50;
     const SCROLL_THRESHOLD = 300;
-    
+     
     const i18n = {
         en: {
             title: "ImgNaondo",
@@ -897,11 +897,9 @@ function getHTML() {
             tag_no_tags: "Nog geen tags"
         }
     };
-    
+     
     let password = '';
     let fullLibrary = [];
-    let filteredLibrary = [];
-    let renderedCount = 0;
     
     let selectedImages = new Set();
     let selectMode = false;
@@ -912,6 +910,9 @@ function getHTML() {
     let lightboxIndex = -1;
     let currentLang = 'en';
     let allTags = [];
+    
+    let nextCursor = undefined;
+    let hasMoreImages = true;
 
     function initLanguage() {
         const savedLang = localStorage.getItem(LANG_KEY);
@@ -935,7 +936,7 @@ function getHTML() {
         localStorage.setItem(LANG_KEY, lang);
         updateUIText();
         renderSortOptions();
-        
+         
         if (fullLibrary.length > 0) {
             renderTagCloud();
             if (document.getElementById('bulkActions').classList.contains('show')) {
@@ -943,8 +944,7 @@ function getHTML() {
             }
             const gallery = document.getElementById('gallery');
             gallery.innerHTML = '';
-            renderedCount = 0;
-            renderNextBatch();
+            renderAppendedBatch(fullLibrary);
         } else {
             const gallery = document.getElementById('gallery');
             if(gallery.innerHTML.includes('no-images')) {
@@ -974,7 +974,7 @@ function getHTML() {
             tagBtn.textContent = tagCloudExpanded ? t('collapse') : t('expand');
         }
     }
-    
+     
     function renderSortOptions() {
         const select = document.getElementById('sortSelect');
         const currentVal = select.value || 'time-desc';
@@ -1040,63 +1040,65 @@ function getHTML() {
 
     async function loadData() {
       fullLibrary = [];
-      filteredLibrary = [];
-      renderedCount = 0;
+      nextCursor = undefined;
+      hasMoreImages = true;
       document.getElementById('gallery').innerHTML = '';
       document.getElementById('endMessage').classList.add('hidden');
       
       loadStats();
-      await fetchFullLibrary();
+      loadTags();
+      await fetchNextPage();
     }
 
-    async function fetchFullLibrary() {
-      if (isLoadingLibrary) return;
+    async function fetchNextPage() {
+      if (isLoadingLibrary || !hasMoreImages) return;
       isLoadingLibrary = true;
       showBottomLoader(true);
       
-      let cursor = null;
-      let hasMore = true;
-      let isFirstPage = true;
-
       try {
-        while (hasMore) {
-          const qs = new URLSearchParams({ limit: '1000' });
-          if (cursor) qs.set('cursor', cursor);
-          
-          const res = await fetch('/api/list?' + qs.toString(), {
-            headers: { 'Authorization': 'Bearer ' + password }
-          });
-          
-          if (!res.ok) throw new Error('Failed to fetch list');
-          
-          const data = await res.json();
-          
-          const newItems = data.images.map(img => ({
-            ...img,
-            _searchStr: (img.customName + ' ' + img.originalName + ' ' + (img.tags||'')).toLowerCase()
-          }));
-          
-          fullLibrary.push(...newItems);
-          
-          if (isFirstPage) {
-            loadTags();
-            applyFilters();
-            isFirstPage = false;
-          } else {
-            updateStatsUI();
-          }
-
-          cursor = data.cursor;
-          hasMore = data.truncated && !!cursor;
-          
-          if(hasMore) await new Promise(r => setTimeout(r, 50));
-        }
+        const qs = new URLSearchParams({ limit: '50' });
+        if (nextCursor) qs.set('cursor', nextCursor);
         
-        updateStatsUI();
-        if (fullLibrary.length > renderedCount) {
-             applyFilters(false);
+        const res = await fetch('/api/list?' + qs.toString(), {
+          headers: { 'Authorization': 'Bearer ' + password }
+        });
+        
+        if (!res.ok) throw new Error('Failed to fetch list');
+        
+        const data = await res.json();
+        
+        const newItems = data.images.map(img => ({
+          ...img,
+          _searchStr: (img.customName + ' ' + img.originalName + ' ' + (img.tags||'')).toLowerCase()
+        }));
+        
+        fullLibrary.push(...newItems);
+        
+        // 🐛 BUG FIX: Apply current filtering conditions to the newly loaded batch before rendering
+        const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+        
+        let filteredNewItems = newItems;
+
+        if (activeTag) {
+            const tagSearch = activeTag.toLowerCase();
+            filteredNewItems = filteredNewItems.filter(img => (img.tags || '').toLowerCase().includes(tagSearch));
         }
-        document.getElementById('endMessage').classList.remove('hidden');
+
+        if (searchTerm) {
+            filteredNewItems = filteredNewItems.filter(img => img._searchStr.includes(searchTerm));
+        }
+
+        renderAppendedBatch(filteredNewItems);
+        // -------------------------------------------------------------------------------------
+
+        updateStatsUI();
+
+        nextCursor = data.cursor;
+        hasMoreImages = data.truncated && !!nextCursor;
+        
+        if (!hasMoreImages) {
+             document.getElementById('endMessage').classList.remove('hidden');
+        }
 
       } catch (e) {
         console.error(e);
@@ -1107,7 +1109,7 @@ function getHTML() {
       }
     }
 
-    function applyFilters(resetRender = true) {
+    function applyFilters() {
       const searchTerm = document.getElementById('searchInput').value.toLowerCase();
       const sortBy = document.getElementById('sortSelect').value;
 
@@ -1134,39 +1136,30 @@ function getHTML() {
         }
       });
 
-      filteredLibrary = temp;
-      
-      if (resetRender) {
-        document.getElementById('gallery').innerHTML = '';
-        renderedCount = 0;
-        renderNextBatch();
-      }
-      
-      const totalSpan = document.getElementById('totalImages');
-      if (filteredLibrary.length !== fullLibrary.length) {
-        totalSpan.textContent = \`\${filteredLibrary.length} / \${fullLibrary.length}\`;
-      } else {
-        totalSpan.textContent = fullLibrary.length;
-      }
+      document.getElementById('gallery').innerHTML = '';
+      renderAppendedBatch(temp);
     }
 
-    function renderNextBatch() {
+    function renderAppendedBatch(items) {
       const gallery = document.getElementById('gallery');
       
-      if (filteredLibrary.length === 0) {
+      if (items.length === 0 && fullLibrary.length === 0) {
         gallery.innerHTML = \`<div class="no-images">\${t('no_images_found')}</div>\`;
         return;
       }
-
-      const start = renderedCount;
-      const end = Math.min(renderedCount + PAGE_SIZE, filteredLibrary.length);
-      
-      if (start >= end) return;
+      // If there are no items to render but the library is not empty (i.e., filtering results in nothing)
+      if (items.length === 0 && fullLibrary.length > 0 && document.getElementById('gallery').children.length === 0) {
+        gallery.innerHTML = \`<div class="no-images">\${t('no_images_found')}</div>\`;
+        return;
+      }
+      // If we are appending and the gallery currently shows the "no images found" message, clear it
+      if(items.length > 0 && gallery.querySelector('.no-images')) {
+           gallery.innerHTML = '';
+      }
 
       const fragment = document.createDocumentFragment();
       
-      for (let i = start; i < end; i++) {
-        const img = filteredLibrary[i];
+      items.forEach(img => {
         const card = document.createElement('div');
         card.className = 'image-card' + (selectedImages.has(img.key) ? ' selected' : '');
         
@@ -1198,24 +1191,15 @@ function getHTML() {
           </div>
         \`;
         fragment.appendChild(card);
-      }
+      });
       
       gallery.appendChild(fragment);
-      renderedCount = end;
-
-      if (renderedCount >= filteredLibrary.length) {
-        document.getElementById('infiniteLoader').classList.add('hidden');
-        document.getElementById('endMessage').classList.remove('hidden');
-      } else {
-        document.getElementById('infiniteLoader').classList.remove('hidden');
-        document.getElementById('endMessage').classList.add('hidden');
-      }
     }
 
     window.addEventListener('scroll', () => {
       const scrollBottom = document.documentElement.scrollHeight - (window.scrollY + window.innerHeight);
       if (scrollBottom < SCROLL_THRESHOLD) {
-        renderNextBatch();
+        fetchNextPage();
       }
     });
 
@@ -1230,7 +1214,7 @@ function getHTML() {
 
     async function loadStats() {
     }
-    
+     
     function updateStatsUI() {
         let totalSize = 0;
         fullLibrary.forEach(img => totalSize += (img.size || 0));
@@ -1239,21 +1223,14 @@ function getHTML() {
     }
 
     async function loadTags() {
-       const tagCounts = {};
-       fullLibrary.forEach(img => {
-           if(img.tags) {
-               img.tags.split(',').forEach(t => {
-                   const tag = t.trim();
-                   if(tag) tagCounts[tag] = (tagCounts[tag] || 0) + 1;
-               });
-           }
+       const res = await fetch('/api/tags', {
+          headers: { 'Authorization': 'Bearer ' + password }
        });
-       
-       allTags = Object.entries(tagCounts)
-         .map(([tag, count]) => ({ tag, count }))
-         .sort((a, b) => b.count - a.count);
-       
-       renderTagCloud();
+       if(res.ok) {
+           const data = await res.json();
+           allTags = data.tags;
+           renderTagCloud();
+       }
     }
 
     function renderTagCloud() {
@@ -1277,6 +1254,13 @@ function getHTML() {
           document.getElementById('searchInput').value = tag;
       }
       renderTagCloud();
+      
+      // When filtering by tag, we need to reset the displayed images to the beginning 
+      // but NOT reset the fullLibrary or cursor, since we are only filtering CLIENT-SIDE.
+      const gallery = document.getElementById('gallery');
+      gallery.innerHTML = ''; // Clear current display
+      
+      // Then re-apply filters and re-render the *already loaded* items.
       applyFilters();
     }
 
@@ -1319,6 +1303,48 @@ function getHTML() {
                  _searchStr: (data.customName + ' ' + file.name + ' ' + data.tags).toLowerCase()
              };
              fullLibrary.unshift(newImage);
+             const gallery = document.getElementById('gallery');
+             if(gallery.querySelector('.no-images')) gallery.innerHTML = '';
+             
+             // --- Only prepend if it matches the current filter/search condition ---
+             const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+             const tagSearch = activeTag ? activeTag.toLowerCase() : '';
+             const matchesTag = !tagSearch || (newImage.tags || '').toLowerCase().includes(tagSearch);
+             const matchesSearch = !searchTerm || newImage._searchStr.includes(searchTerm);
+
+             if (matchesTag && matchesSearch) {
+                const card = document.createElement('div');
+                card.className = 'image-card';
+                const displayName = newImage.customName || newImage.originalName;
+                const safeName = displayName.replace(/"/g, '&quot;');
+                const tagsHtml = newImage.tags ? newImage.tags.split(',').map(tag => \`<span class="image-tag">\${tag.trim()}</span>\`).join('') : '';
+                
+                card.innerHTML = \`
+                  \${selectMode ? \`<input type="checkbox" class="checkbox" onchange="toggleSelect('\${newImage.key}')">\` : ''}
+                  <img src="\${newImage.url}" alt="\${safeName}" loading="lazy"
+                       onclick="openLightbox('\${newImage.key}')"
+                       onerror="this.src='data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI1MCIgaGVpZ2h0PSI1MCI+PHJlY3Qgd2lkdGg9IjUwIiBoZWlnaHQ9IjUwIiBmaWxsPSIjZWVlIi8+PC9zdmc+'">
+                  <div class="image-info">
+                    <div class="image-name" title="\${safeName}">\${displayName}</div>
+                    <div class="image-meta">\${formatSize(newImage.size)} • \${new Date(newImage.uploadTime).toLocaleDateString()}</div>
+                    \${tagsHtml ? \`<div class="image-tags">\${tagsHtml}</div>\` : ''}
+                    <div class="image-actions">
+                      <div class="copy-dropdown">
+                        <button onclick="toggleCopyMenu(event)">\${t('copy')} ▾</button>
+                        <div class="copy-dropdown-menu" onclick="event.stopPropagation()">
+                          <button onclick="handleCopy('\${newImage.key}', 'url')">URL</button>
+                          <button onclick="handleCopy('\${newImage.key}', 'html')">HTML</button>
+                          <button onclick="handleCopy('\${newImage.key}', 'md')">Markdown</button>
+                        </div>
+                      </div>
+                      <button onclick="openEdit('\${newImage.key}')">\${t('edit')}</button>
+                      <button class="btn-danger" onclick="deleteImage('\${newImage.key}')">\${t('del')}</button>
+                    </div>
+                  </div>
+                \`;
+                gallery.prepend(card);
+             }
+             // -------------------------------------------------------------------------------------
           }
         }
       } catch(e) { console.error(e); }
@@ -1333,7 +1359,6 @@ function getHTML() {
       if (successCount > 0) {
           showToast(t('toast_uploaded', successCount));
           loadTags();
-          applyFilters();
           updateStatsUI();
       }
     }
@@ -1350,13 +1375,12 @@ function getHTML() {
           
           showToast(t('toast_deleted'));
           loadTags();
-          applyFilters(false);
-          applyFilters(true);
+          applyFilters();
           updateStatsUI();
         }
       } catch (e) { showToast(e.message); }
     }
-    
+     
     function updateSelectionCount() {
         document.getElementById('selectedCount').textContent = t('msg_selected', selectedImages.size);
     }
@@ -1407,7 +1431,6 @@ function getHTML() {
            closeEditModal();
            showToast(t('toast_saved'));
            loadTags();
-           applyFilters(false);
            applyFilters();
         }
       } catch(e) { showToast(e.message); }
@@ -1417,7 +1440,7 @@ function getHTML() {
       const el = document.getElementById('infiniteLoader');
       if (show) el.classList.remove('hidden'); else el.classList.add('hidden');
     }
-    
+     
     function toggleSelectMode() {
       selectMode = !selectMode;
       if (!selectMode) {
@@ -1428,8 +1451,7 @@ function getHTML() {
         document.getElementById('bulkActions').classList.add('show');
       }
       document.getElementById('gallery').innerHTML = '';
-      renderedCount = 0;
-      renderNextBatch();
+      renderAppendedBatch(fullLibrary);
     }
 
     function toggleSelect(key) {
@@ -1437,25 +1459,19 @@ function getHTML() {
       else selectedImages.add(key);
       updateSelectionCount();
     }
-    
+     
     function selectAll() {
-      filteredLibrary.forEach(img => selectedImages.add(img.key));
+      fullLibrary.forEach(img => selectedImages.add(img.key));
       updateSelectionCount();
-      const scroll = window.scrollY;
       document.getElementById('gallery').innerHTML = '';
-      renderedCount = 0;
-      renderNextBatch();
-      window.scrollTo(0, scroll);
+      renderAppendedBatch(fullLibrary);
     }
-    
+     
     function deselectAll() {
       selectedImages.clear();
       updateSelectionCount();
-      const scroll = window.scrollY;
       document.getElementById('gallery').innerHTML = '';
-      renderedCount = 0;
-      renderNextBatch();
-      window.scrollTo(0, scroll);
+      renderAppendedBatch(fullLibrary);
     }
 
     function openEdit(key) {
@@ -1468,22 +1484,22 @@ function getHTML() {
       document.getElementById('editModal').classList.add('show');
     }
     function closeEditModal() { document.getElementById('editModal').classList.remove('show'); }
-    
+     
     function openLightbox(key) {
-      lightboxIndex = filteredLibrary.findIndex(i => i.key === key);
+      lightboxIndex = fullLibrary.findIndex(i => i.key === key);
       if (lightboxIndex < 0) return;
       updateLightbox();
       document.getElementById('lightbox').classList.add('show');
     }
     function updateLightbox() {
-      const img = filteredLibrary[lightboxIndex];
+      const img = fullLibrary[lightboxIndex];
       if (!img) return;
       const el = document.getElementById('lightboxImg');
       el.src = img.url;
       el.alt = img.customName || img.originalName;
     }
     function prevImage(e) { e && e.stopPropagation(); if (lightboxIndex > 0) { lightboxIndex--; updateLightbox(); } }
-    function nextImage(e) { e && e.stopPropagation(); if (lightboxIndex < filteredLibrary.length - 1) { lightboxIndex++; updateLightbox(); } }
+    function nextImage(e) { e && e.stopPropagation(); if (lightboxIndex < fullLibrary.length - 1) { lightboxIndex++; updateLightbox(); } }
     function closeLightbox() { document.getElementById('lightbox').classList.remove('show'); }
 
     function toggleTagCloud() {
@@ -1493,25 +1509,25 @@ function getHTML() {
       if (tagCloudExpanded) { content.classList.add('expanded'); btn.textContent = t('collapse'); }
       else { content.classList.remove('expanded'); btn.textContent = t('expand'); }
     }
-    
+     
     function showToast(msg) {
       const t = document.createElement('div'); t.className='toast'; t.textContent=msg;
       document.body.appendChild(t); setTimeout(()=>t.remove(), 2500);
     }
-    
+     
     function toggleCopyMenu(e) {
       e.stopPropagation();
       const wrap = e.target.closest('.copy-dropdown');
       document.querySelectorAll('.copy-dropdown.open').forEach(el => { if (el !== wrap) el.classList.remove('open'); });
       wrap.classList.toggle('open');
     }
-    
+     
     async function attemptCopy(text) {
       if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return; }
       const ta = document.createElement('textarea'); ta.value = text; ta.style.position='fixed'; ta.style.left='-9999px';
       document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
     }
-    
+     
     function buildCopyText(url, alt, fmt) {
       switch (fmt) {
         case 'url': return url;
@@ -1524,7 +1540,7 @@ function getHTML() {
       try { await attemptCopy(buildCopyText(url, alt, fmt)); showToast(t('toast_copy_ok')); }
       catch (e) { showToast(t('toast_copy_fail')); }
     }
-    
+     
     function formatSize(bytes) {
       if (bytes < 1024) return bytes + ' B';
       if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
@@ -1532,11 +1548,23 @@ function getHTML() {
     }
 
     document.addEventListener('click', () => document.querySelectorAll('.copy-dropdown.open').forEach(el => el.classList.remove('open')));
-    
+     
     document.getElementById('searchInput').addEventListener('input', () => {
+        // When search input changes, we MUST clear the gallery and re-render only the filtered subset
+        const gallery = document.getElementById('gallery');
+        gallery.innerHTML = '';
+        
+        // Ensure activeTag is null if search is used and tag filter is active
+        if (activeTag && document.getElementById('searchInput').value.toLowerCase().includes(activeTag.toLowerCase())) {
+            // Keep activeTag active if the search is a superset of the tag (e.g. tag is 'cat', search is 'cat funny')
+        } else {
+            // If search input is cleared, re-render based on current tag/sort
+            // If search input is entered, filter against activeTag
+        }
+
         applyFilters();
     });
-    
+     
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') { closeEditModal(); closeLightbox(); }
       else if (document.getElementById('lightbox').classList.contains('show')) {
@@ -1544,7 +1572,7 @@ function getHTML() {
         if (e.key === 'ArrowRight') nextImage();
       }
     });
-    
+     
     window.addEventListener('paste', async (e) => {
       const items = e.clipboardData && e.clipboardData.items;
       if (!items || !items.length) return;
