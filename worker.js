@@ -112,28 +112,15 @@ async function handleUpload(request, env, corsHeaders) {
   const filename = `${timestamp}_${randomStr}.${extension}`;
 
   const normalizedTags = tags.split(',').map(t => t.trim()).filter(Boolean).join(',');
+  const uploadTime = new Date().toISOString();
 
   await env.IMAGES.put(filename, file.stream(), {
-    httpMetadata: { contentType: file.type },
-    customMetadata: {
-      originalName: file.name,
-      customName: customName.trim(),
-      uploadTime: new Date().toISOString(),
-      size: file.size.toString(),
-      tags: normalizedTags,
-    }
+    httpMetadata: { contentType: file.type }
   });
 
-  // Update Index
-  const newEntry = {
-    key: filename,
-    size: parseInt(file.size),
-    uploadTime: new Date().toISOString(),
-    originalName: file.name,
-    customName: customName.trim(),
-    tags: normalizedTags
-  };
-  await updateIndex(env, 'add', newEntry);
+  await env.DB.prepare(
+    'INSERT INTO images (key, originalName, customName, uploadTime, size, tags, contentType) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).bind(filename, file.name, customName.trim(), uploadTime, file.size, normalizedTags, file.type).run();
 
   const imageUrl = `${new URL(request.url).origin}/img/${filename}`;
 
@@ -154,30 +141,38 @@ async function handleList(request, env, corsHeaders) {
   const limit = parseInt(url.searchParams.get('limit') || '50');
   const cursor = url.searchParams.get('cursor') || undefined;
 
-  const options = { limit, include: ['customMetadata'] };
-  if (cursor) options.cursor = cursor;
+  let query = 'SELECT * FROM images ';
+  let params = [];
+  
+  if (cursor) {
+    query += 'WHERE uploadTime < ? ';
+    params.push(cursor);
+  }
+  
+  query += 'ORDER BY uploadTime DESC LIMIT ?';
+  params.push(limit + 1);
 
-  const listed = await env.IMAGES.list(options);
+  const { results } = await env.DB.prepare(query).bind(...params).all();
 
-  const images = listed.objects
-    .filter(obj => obj.key !== 'metadata_index.json' && obj.key !== 'index.lock')
-    .map((obj) => {
-      const metadata = obj.customMetadata || {};
-      return {
-        key: obj.key,
-        url: `${new URL(request.url).origin}/img/${obj.key}`,
-        size: parseInt(metadata.size || obj.size || 0),
-        uploadTime: metadata.uploadTime || obj.uploaded.toISOString(),
-        originalName: metadata.originalName || obj.key,
-        customName: metadata.customName || '',
-        tags: metadata.tags || '',
-      };
-    });
+  const hasMore = results.length > limit;
+  const items = results.slice(0, limit);
+  
+  const images = items.map((img) => {
+    return {
+      key: img.key,
+      url: `${new URL(request.url).origin}/img/${img.key}`,
+      size: img.size,
+      uploadTime: img.uploadTime,
+      originalName: img.originalName,
+      customName: img.customName || '',
+      tags: img.tags || '',
+    };
+  });
 
   return new Response(JSON.stringify({
     images,
-    truncated: listed.truncated === true,
-    cursor: listed.cursor || null
+    truncated: hasMore,
+    cursor: hasMore ? items[items.length - 1].uploadTime : null
   }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 }
 
@@ -190,7 +185,7 @@ async function handleDelete(request, env, corsHeaders, path) {
 
   const filename = path.replace('/api/delete/', '');
   await env.IMAGES.delete(filename);
-  await updateIndex(env, 'delete', filename);
+  await env.DB.prepare('DELETE FROM images WHERE key = ?').bind(filename).run();
 
   return new Response(JSON.stringify({ success: true }), {
     headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -199,11 +194,6 @@ async function handleDelete(request, env, corsHeaders, path) {
 
 async function handleImage(request, env, path) {
   const filename = path.replace('/img/', '');
-
-  // 🔒 SECURITY FIX: Prevent public access to the index file
-  if (filename === 'metadata_index.json') {
-    return new Response('Access Denied', { status: 403 });
-  }
 
   const object = await env.IMAGES.get(filename);
   if (!object) return new Response('Image not found', { status: 404 });
@@ -222,16 +212,12 @@ async function handleStats(request, env, corsHeaders) {
     });
   }
 
-  // OPTIMIZATION: Read from index.json instead of listing bucket
-  const object = await env.IMAGES.get(INDEX_KEY);
-  let totalSize = 0;
-  let totalImages = 0;
+  const stats = await env.DB.prepare(
+    'SELECT COUNT(*) as totalImages, SUM(size) as totalSize FROM images'
+  ).first();
 
-  if (object) {
-    const index = await object.json();
-    totalImages = index.length;
-    totalSize = index.reduce((acc, img) => acc + (parseInt(img.size) || 0), 0);
-  }
+  const totalImages = stats.totalImages || 0;
+  const totalSize = stats.totalSize || 0;
 
   return new Response(JSON.stringify({
     totalImages,
@@ -248,32 +234,11 @@ async function handleRename(request, env, corsHeaders) {
   }
 
   const { filename, customName, tags } = await request.json();
-  const object = await env.IMAGES.get(filename);
-  if (!object) {
-    return new Response(JSON.stringify({ error: 'Image not found' }), {
-      status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders }
-    });
-  }
-
-  const oldMetadata = object.customMetadata || {};
   const normalizedTags = tags ? tags.split(',').map(t => t.trim()).filter(Boolean).join(',') : '';
 
-  await env.IMAGES.put(filename, object.body, {
-    httpMetadata: object.httpMetadata,
-    customMetadata: {
-      ...oldMetadata,
-      customName: (customName || '').trim(),
-      tags: normalizedTags,
-    }
-  });
-
-  await updateIndex(env, 'update', {
-    key: filename,
-    changes: {
-      customName: (customName || '').trim(),
-      tags: normalizedTags
-    }
-  });
+  await env.DB.prepare(
+    'UPDATE images SET customName = ?, tags = ? WHERE key = ?'
+  ).bind((customName || '').trim(), normalizedTags, filename).run();
 
   return new Response(JSON.stringify({ success: true }), {
     headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -294,6 +259,7 @@ async function handleBatchDelete(request, env, corsHeaders) {
     });
   }
 
+  // Delete from R2
   if (filenames.length <= 1000) {
     await env.IMAGES.delete(filenames);
   } else {
@@ -303,7 +269,12 @@ async function handleBatchDelete(request, env, corsHeaders) {
     }
   }
 
-  await updateIndex(env, 'batch-delete', filenames);
+  // Delete from D1 in batches
+  for (let i = 0; i < filenames.length; i += 100) {
+    const chunk = filenames.slice(i, i + 100);
+    const placeholders = chunk.map(() => '?').join(',');
+    await env.DB.prepare(`DELETE FROM images WHERE key IN (${placeholders})`).bind(...chunk).run();
+  }
 
   return new Response(JSON.stringify({ success: true, deleted: filenames.length }), {
     headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -317,22 +288,17 @@ async function handleGetTags(request, env, corsHeaders) {
     });
   }
 
-  // OPTIMIZATION: Read from index.json instead of listing bucket
-  const object = await env.IMAGES.get(INDEX_KEY);
-  const tagCount = {};
+  const { results } = await env.DB.prepare(
+    'SELECT tags FROM images WHERE tags IS NOT NULL AND tags != ""'
+  ).all();
 
-  if (object) {
-    const index = await object.json();
-    index.forEach(img => {
-      const tags = img.tags || '';
-      if (tags) {
-        tags.split(',').forEach(tag => {
-          const trimmed = tag.trim();
-          if (trimmed) tagCount[trimmed] = (tagCount[trimmed] || 0) + 1;
-        });
-      }
+  const tagCount = {};
+  results.forEach(row => {
+    row.tags.split(',').forEach(tag => {
+      const trimmed = tag.trim();
+      if (trimmed) tagCount[trimmed] = (tagCount[trimmed] || 0) + 1;
     });
-  }
+  });
 
   const tagList = Object.entries(tagCount)
     .map(([tag, count]) => ({ tag, count }))
@@ -343,8 +309,6 @@ async function handleGetTags(request, env, corsHeaders) {
   });
 }
 
-const INDEX_KEY = 'metadata_index.json';
-
 async function handleGetIndex(request, env, corsHeaders) {
   if (!verifyPassword(request, env)) {
     return new Response(JSON.stringify({ error: 'Incorrect password' }), {
@@ -352,14 +316,9 @@ async function handleGetIndex(request, env, corsHeaders) {
     });
   }
 
-  const obj = await env.IMAGES.get(INDEX_KEY);
-  if (!obj) {
-    return new Response(JSON.stringify([]), {
-      headers: { 'Content-Type': 'application/json', ...corsHeaders }
-    });
-  }
+  const { results } = await env.DB.prepare('SELECT * FROM images ORDER BY uploadTime DESC').all();
 
-  return new Response(obj.body, {
+  return new Response(JSON.stringify(results), {
     headers: { 'Content-Type': 'application/json', ...corsHeaders }
   });
 }
@@ -371,136 +330,39 @@ async function handleRebuildIndex(request, env, corsHeaders) {
     });
   }
 
-  await rebuildIndex(env);
+  // Migration logic: Sync R2 to D1
+  let cursor;
+  let totalMigrated = 0;
 
-  return new Response(JSON.stringify({ success: true }), {
+  do {
+    const listed = await env.IMAGES.list({ limit: 100, include: ['customMetadata'], cursor });
+
+    for (const obj of listed.objects) {
+      if (obj.key === 'metadata_index.json' || obj.key === 'index.lock') continue;
+
+      const metadata = obj.customMetadata || {};
+      const uploadTime = metadata.uploadTime || obj.uploaded.toISOString();
+      
+      await env.DB.prepare(
+        'INSERT OR IGNORE INTO images (key, originalName, customName, uploadTime, size, tags, contentType) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      ).bind(
+        obj.key,
+        metadata.originalName || obj.key,
+        metadata.customName || '',
+        uploadTime,
+        parseInt(metadata.size || obj.size || 0),
+        metadata.tags || '',
+        obj.httpMetadata?.contentType || ''
+      ).run();
+      
+      totalMigrated++;
+    }
+
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+
+  return new Response(JSON.stringify({ success: true, migrated: totalMigrated }), {
     headers: { 'Content-Type': 'application/json', ...corsHeaders }
-  });
-}
-
-const LOCK_KEY = 'index.lock';
-
-async function acquireLock(env, maxRetries = 5) {
-  for (let i = 0; i < maxRetries; i++) {
-    const lock = await env.IMAGES.get(LOCK_KEY);
-    if (!lock) {
-      const id = crypto.randomUUID();
-      await env.IMAGES.put(LOCK_KEY, id);
-      // Double check to ensure we won the race (S3 strong consistency helps here but not perfect CAS)
-      const check = await env.IMAGES.get(LOCK_KEY);
-      const val = await check.text();
-      if (val === id) return id;
-    }
-    await new Promise(r => setTimeout(r, 200 + Math.random() * 200)); // Jitter
-  }
-  throw new Error('Could not acquire lock');
-}
-
-async function releaseLock(env, id) {
-  const lock = await env.IMAGES.get(LOCK_KEY);
-  if (lock) {
-    const val = await lock.text();
-    if (val === id) await env.IMAGES.delete(LOCK_KEY);
-  }
-}
-
-async function updateIndex(env, type, data) {
-  let lockId = null;
-  try {
-    lockId = await acquireLock(env);
-
-    // Read current index
-    const obj = await env.IMAGES.get(INDEX_KEY);
-    let index = [];
-    if (obj) {
-      index = await obj.json();
-    }
-
-    // Apply changes
-    if (type === 'add') {
-      index.unshift(data);
-    } else if (type === 'delete') {
-      index = index.filter(item => item.key !== data);
-    } else if (type === 'batch-delete') {
-      const set = new Set(data);
-      index = index.filter(item => !set.has(item.key));
-    } else if (type === 'update') {
-      const idx = index.findIndex(item => item.key === data.key);
-      if (idx !== -1) {
-        index[idx] = { ...index[idx], ...data.changes };
-      }
-    }
-
-    // Write back
-    await env.IMAGES.put(INDEX_KEY, JSON.stringify(index), {
-      httpMetadata: { contentType: 'application/json' }
-    });
-
-  } catch (e) {
-    console.error('Failed to update index:', e);
-    // If lock failed, we might want to trigger a background rebuild or just fail silently
-  } finally {
-    if (lockId) await releaseLock(env, lockId);
-  }
-}
-
-async function rebuildIndex(env) {
-  const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
-  const encoder = new TextEncoder();
-
-  // Start background processing
-  // This allows us to stream the R2 list results directly into the new JSON file without buffering everything
-  env.IMAGES.list({ limit: 1 }).then(async () => {
-    try {
-      await writer.write(encoder.encode('['));
-
-      let cursor;
-      let isFirst = true;
-      let totalProcessed = 0;
-
-      do {
-        const listed = await env.IMAGES.list({ limit: 1000, include: ['customMetadata'], cursor });
-
-        for (const obj of listed.objects) {
-          if (obj.key === INDEX_KEY || obj.key === LOCK_KEY) continue;
-
-          const metadata = obj.customMetadata || {};
-          const item = {
-            key: obj.key,
-            size: parseInt(metadata.size || obj.size || 0),
-            uploadTime: metadata.uploadTime || obj.uploaded.toISOString(),
-            originalName: metadata.originalName || obj.key,
-            customName: metadata.customName || '',
-            tags: metadata.tags || '',
-          };
-
-          if (!isFirst) {
-            await writer.write(encoder.encode(','));
-          }
-          await writer.write(encoder.encode(JSON.stringify(item)));
-          isFirst = false;
-        }
-
-        cursor = listed.truncated ? listed.cursor : undefined;
-        totalProcessed += listed.objects.length;
-
-        // Memory Safety: Yield to event loop to preventing blocking
-        await new Promise(r => setTimeout(r, 0));
-
-      } while (cursor);
-
-      await writer.write(encoder.encode(']'));
-      await writer.close();
-
-    } catch (e) {
-      console.error('Streaming rebuild failed:', e);
-      writer.abort(e);
-    }
-  });
-
-  await env.IMAGES.put(INDEX_KEY, readable, {
-    httpMetadata: { contentType: 'application/json' }
   });
 }
 
@@ -650,7 +512,7 @@ function getHTML() {
             <option value="nl">Nederlands</option>
         </select>
         <button id="logoutButton" class="hidden btn-danger" onclick="logout()" style="padding: 8px 15px;" data-i18n="logout">Logout</button>
-        <button id="rebuildIndexBtn" class="hidden" onclick="rebuildIndex()" style="padding: 8px 15px; background: #e67e22; color: white; border: none; border-radius: 4px; cursor: pointer;" title="Rebuild Search Index">↻ Index</button>
+        <button id="rebuildIndexBtn" class="hidden" onclick="rebuildIndex()" style="padding: 8px 15px; background: #e67e22; color: white; border: none; border-radius: 4px; cursor: pointer;" title="Rebuild Search Index">↻ Sync</button>
       </div>
     </div>
   </div>
@@ -1103,7 +965,7 @@ function getHTML() {
     
     let nextCursor = undefined;
     let hasMoreImages = true;
-    let fullIndex = null; // Store full search index
+    let fullIndex = null; 
 
     function initLanguage() {
         const savedLang = localStorage.getItem(LANG_KEY);
@@ -1240,8 +1102,6 @@ function getHTML() {
       
       loadStats();
       loadTags();
-      
-      // Attempt to load full index for search
       loadFullIndex();
       
       await fetchNextPage();
@@ -1254,16 +1114,10 @@ function getHTML() {
         });
         if (res.ok) {
            const idx = await res.json();
-           // Pre-process search strings
            fullIndex = idx.map(img => ({
               ...img,
               _searchStr: (img.customName + ' ' + img.originalName + ' ' + (img.tags||'')).toLowerCase()
            }));
-           if(fullIndex.length === 0) {
-             // Index might be empty or missing, trigger background rebuild if library not empty
-             // This is a heuristic; for now just logging.
-             console.log('Index empty');
-           }
         }
       } catch (e) {
          console.log('Failed to load index', e);
@@ -1271,17 +1125,17 @@ function getHTML() {
     }
     
     async function rebuildIndex() {
-      if(!confirm('Rebuild search index? This may take a while.')) return;
+      if(!confirm('Sync R2 metadata to D1? This may take a while.')) return;
       try {
         const res = await fetch('/api/rebuild-index', {
           method: 'POST',
           headers: { 'Authorization': 'Bearer ' + password }
         });
         if(res.ok) {
-          showToast('Index rebuilt');
-          loadFullIndex();
+          showToast('Sync completed');
+          loadData();
         }
-      } catch(e) { showToast('Rebuild failed'); }
+      } catch(e) { showToast('Sync failed'); }
     }
 
     async function fetchNextPage() {
@@ -1308,7 +1162,6 @@ function getHTML() {
         
         fullLibrary.push(...newItems);
         
-        // 🐛 BUG FIX: Apply current filtering conditions to the newly loaded batch before rendering
         const searchTerm = document.getElementById('searchInput').value.toLowerCase();
         
         let filteredNewItems = newItems;
@@ -1323,7 +1176,6 @@ function getHTML() {
         }
 
         renderAppendedBatch(filteredNewItems);
-        // -------------------------------------------------------------------------------------
 
         updateStatsUI();
 
@@ -1343,28 +1195,31 @@ function getHTML() {
       }
     }
 
+    let filteredResults = [];
+    let filteredCursor = 0;
+    const PAGE_SIZE = 50;
+
     function applyFilters() {
       const searchTerm = document.getElementById('searchInput').value.toLowerCase();
       const sortBy = document.getElementById('sortSelect').value;
 
       let temp = null;
+      let isUsingFullIndex = false;
       
-      // If searching and we have a full index, use it!
-      if (searchTerm && fullIndex) {
-          temp = FULL_INDEX_FILTER(searchTerm);
+      if (fullIndex && (searchTerm || activeTag)) {
+          temp = fullIndex;
+          isUsingFullIndex = true;
       } else {
-          // Fallback to currently loaded library (normal behavior)
           temp = fullLibrary;
       }
-      
+
       if (activeTag) {
         const tagSearch = activeTag.toLowerCase();
         temp = temp.filter(img => (img.tags || '').toLowerCase().includes(tagSearch));
       }
 
-      if (searchTerm && !fullIndex) {
-         // Only Client-side search if no index available
-        temp = temp.filter(img => img._searchStr.includes(searchTerm));
+      if (searchTerm) {
+         temp = temp.filter(img => img._searchStr.includes(searchTerm));
       }
 
       temp.sort((a, b) => {
@@ -1379,12 +1234,31 @@ function getHTML() {
         }
       });
 
-      document.getElementById('gallery').innerHTML = '';
-      renderAppendedBatch(temp);
+      if (isUsingFullIndex) {
+          filteredResults = temp;
+          filteredCursor = 0;
+          document.getElementById('gallery').innerHTML = '';
+          renderNextFilteredBatch();
+          document.getElementById('endMessage').classList.add('hidden');
+      } else {
+          filteredResults = [];
+          document.getElementById('gallery').innerHTML = '';
+          renderAppendedBatch(temp);
+          if (!hasMoreImages) document.getElementById('endMessage').classList.remove('hidden');
+      }
     }
     
-    function FULL_INDEX_FILTER(term) {
-       return fullIndex.filter(img => img._searchStr.includes(term));
+    function renderNextFilteredBatch() {
+        if (filteredResults.length === 0 && fullLibrary.length > 0) {
+             document.getElementById('gallery').innerHTML = \`<div class="no-images">\${t('no_images_found')}</div>\`;
+             return;
+        }
+        
+        const batch = filteredResults.slice(filteredCursor, filteredCursor + PAGE_SIZE);
+        if (batch.length > 0) {
+            renderAppendedBatch(batch);
+            filteredCursor += PAGE_SIZE;
+        }
     }
 
     function renderAppendedBatch(items) {
@@ -1394,12 +1268,10 @@ function getHTML() {
         gallery.innerHTML = \`<div class="no-images">\${t('no_images_found')}</div>\`;
         return;
       }
-      // If there are no items to render but the library is not empty (i.e., filtering results in nothing)
       if (items.length === 0 && fullLibrary.length > 0 && document.getElementById('gallery').children.length === 0) {
         gallery.innerHTML = \`<div class="no-images">\${t('no_images_found')}</div>\`;
         return;
       }
-      // If we are appending and the gallery currently shows the "no images found" message, clear it
       if(items.length > 0 && gallery.querySelector('.no-images')) {
            gallery.innerHTML = '';
       }
@@ -1446,35 +1318,41 @@ function getHTML() {
     window.addEventListener('scroll', () => {
       const scrollBottom = document.documentElement.scrollHeight - (window.scrollY + window.innerHeight);
       if (scrollBottom < SCROLL_THRESHOLD) {
-        fetchNextPage();
+        if (filteredResults.length > 0) {
+            renderNextFilteredBatch();
+        } else {
+            fetchNextPage();
+        }
       }
     });
 
     function handleCopy(key, type) {
-       const img = fullLibrary.find(i => i.key === key);
+       const img = fullLibrary.find(i => i.key === key) || (fullIndex && fullIndex.find(i => i.key === key));
        if(img) {
+         const url = img.url || \`\${location.origin}/img/\${img.key}\`;
          const alt = img.customName || img.originalName;
-         copyInFormat(img.url, alt, type);
+         copyInFormat(url, alt, type);
        }
        document.querySelectorAll('.copy-dropdown.open').forEach(el => el.classList.remove('open'));
     }
 
     async function loadStats() {
+      try {
+        const res = await fetch('/api/stats', { headers: { 'Authorization': 'Bearer ' + password } });
+        if (res.ok) {
+          const data = await res.json();
+          document.getElementById('totalImages').textContent = data.totalImages;
+          document.getElementById('totalSize').textContent = data.totalSizeMB + ' MB';
+        }
+      } catch (e) {}
     }
      
     function updateStatsUI() {
-        // If we have full index, use that for accurate stats!
         if (fullIndex && fullIndex.length > 0) {
            let totalSize = 0;
            fullIndex.forEach(img => totalSize += (img.size || 0));
            document.getElementById('totalImages').textContent = fullIndex.length;
            document.getElementById('totalSize').textContent = (totalSize / (1024 * 1024)).toFixed(2) + ' MB';
-        } else {
-             // Fallback
-             let totalSize = 0;
-             fullLibrary.forEach(img => totalSize += (img.size || 0));
-             document.getElementById('totalImages').textContent = fullLibrary.length > 0 ? fullLibrary.length + '+' : '0';
-             document.getElementById('totalSize').textContent = (totalSize / (1024 * 1024)).toFixed(2) + ' MB';
         }
     }
 
@@ -1502,109 +1380,10 @@ function getHTML() {
     }
 
     function filterByTag(tag) {
-      if (activeTag === tag) { 
-          activeTag = null; 
-      } else { 
-          activeTag = tag; 
-      }
+      if (activeTag === tag) { activeTag = null; } else { activeTag = tag; }
       renderTagCloud();
       applyFilters();
     }
-
-    // Client-side pagination state for search/filter results
-    let filteredResults = [];
-    let filteredCursor = 0;
-    const PAGE_SIZE = 50;
-
-    function applyFilters() {
-      const searchTerm = document.getElementById('searchInput').value.toLowerCase();
-      const sortBy = document.getElementById('sortSelect').value;
-
-      let temp = null;
-      let isUsingFullIndex = false;
-      
-      // Determine source: Full Index (Global Search) vs Loaded Library (Local)
-      if (fullIndex && (searchTerm || activeTag)) {
-          temp = fullIndex;
-          isUsingFullIndex = true;
-      } else {
-          temp = fullLibrary;
-      }
-
-      // Apply Filters
-      if (activeTag) {
-        const tagSearch = activeTag.toLowerCase();
-        temp = temp.filter(img => (img.tags || '').toLowerCase().includes(tagSearch));
-      }
-
-      if (searchTerm) {
-         if (isUsingFullIndex) {
-             temp = temp.filter(img => img._searchStr.includes(searchTerm));
-         } else {
-             // Fallback: Filter only what we have
-             temp = temp.filter(img => img._searchStr.includes(searchTerm));
-         }
-      }
-
-      // Apply Sort
-      temp.sort((a, b) => {
-        switch (sortBy) {
-          case 'time-desc': return new Date(b.uploadTime) - new Date(a.uploadTime);
-          case 'time-asc': return new Date(a.uploadTime) - new Date(b.uploadTime);
-          case 'size-desc': return b.size - a.size;
-          case 'size-asc': return a.size - b.size;
-          case 'name-asc': return (a.customName || a.originalName).localeCompare(b.customName || b.originalName);
-          case 'name-desc': return (b.customName || b.originalName).localeCompare(a.customName || a.originalName);
-          default: return 0;
-        }
-      });
-
-      // Handle Display
-      if (isUsingFullIndex) {
-          // If using full index, we takeover the display with client-side pagination
-          filteredResults = temp;
-          filteredCursor = 0;
-          document.getElementById('gallery').innerHTML = '';
-          renderNextFilteredBatch();
-          // Hide 'No more' message while in search mode, as we handle "end" differently
-          document.getElementById('endMessage').classList.add('hidden');
-      } else {
-          // Normal mode: Render everything in temp (which is just fullLibrary filtered)
-          // Reset filtered results to avoid confusion
-          filteredResults = [];
-          document.getElementById('gallery').innerHTML = '';
-          renderAppendedBatch(temp);
-          
-          if (!hasMoreImages) document.getElementById('endMessage').classList.remove('hidden');
-      }
-    }
-    
-    function renderNextFilteredBatch() {
-        if (filteredResults.length === 0) {
-             document.getElementById('gallery').innerHTML = \`<div class="no-images">\${t('no_images_found')}</div>\`;
-             return;
-        }
-        
-        const batch = filteredResults.slice(filteredCursor, filteredCursor + PAGE_SIZE);
-        if (batch.length > 0) {
-            renderAppendedBatch(batch);
-            filteredCursor += PAGE_SIZE;
-        }
-    }
-    
-    // Updated scroll handler to support both modes
-    window.addEventListener('scroll', () => {
-      const scrollBottom = document.documentElement.scrollHeight - (window.scrollY + window.innerHeight);
-      if (scrollBottom < SCROLL_THRESHOLD) {
-        if (filteredResults.length > 0) {
-            // We are in search/filter mode using Full Index
-            renderNextFilteredBatch();
-        } else {
-            // Normal mode: Fetch from server
-            fetchNextPage();
-        }
-      }
-    });
 
     async function uploadFiles(files) {
       const customName = document.getElementById('uploadCustomName').value.trim();
@@ -1613,7 +1392,6 @@ function getHTML() {
       const uploadProgress = document.getElementById('uploadProgress');
       
       uploadButton.disabled = true; 
-      
       let successCount = 0;
       
       try {
@@ -1643,49 +1421,20 @@ function getHTML() {
                  _searchStr: (data.customName + ' ' + file.name + ' ' + data.tags).toLowerCase()
              };
              fullLibrary.unshift(newImage);
-             if(fullIndex) fullIndex.unshift(newImage); // Update local index cache logic
+             if(fullIndex) fullIndex.unshift(newImage);
              const gallery = document.getElementById('gallery');
              if(gallery.querySelector('.no-images')) gallery.innerHTML = '';
              
-             // --- Only prepend if it matches the current filter/search condition ---
              const searchTerm = document.getElementById('searchInput').value.toLowerCase();
              const tagSearch = activeTag ? activeTag.toLowerCase() : '';
              const matchesTag = !tagSearch || (newImage.tags || '').toLowerCase().includes(tagSearch);
              const matchesSearch = !searchTerm || newImage._searchStr.includes(searchTerm);
 
              if (matchesTag && matchesSearch) {
-                const card = document.createElement('div');
-                card.className = 'image-card';
-                const displayName = newImage.customName || newImage.originalName;
-                const safeName = displayName.replace(/"/g, '&quot;');
-                const tagsHtml = newImage.tags ? newImage.tags.split(',').map(tag => \`<span class="image-tag">\${tag.trim()}</span>\`).join('') : '';
-                
-                card.innerHTML = \`
-                  \${selectMode ? \`<input type="checkbox" class="checkbox" onchange="toggleSelect('\${newImage.key}')">\` : ''}
-                  <img src="\${newImage.url}" alt="\${safeName}" loading="lazy"
-                       onclick="openLightbox('\${newImage.key}')"
-                       onerror="this.src='data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI1MCIgaGVpZ2h0PSI1MCI+PHJlY3Qgd2lkdGg9IjUwIiBoZWlnaHQ9IjUwIiBmaWxsPSIjZWVlIi8+PC9zdmc+'">
-                  <div class="image-info">
-                    <div class="image-name" title="\${safeName}">\${displayName}</div>
-                    <div class="image-meta">\${formatSize(newImage.size)} • \${new Date(newImage.uploadTime).toLocaleDateString()}</div>
-                    \${tagsHtml ? \`<div class="image-tags">\${tagsHtml}</div>\` : ''}
-                    <div class="image-actions">
-                      <div class="copy-dropdown">
-                        <button onclick="toggleCopyMenu(event)">\${t('copy')} ▾</button>
-                        <div class="copy-dropdown-menu" onclick="event.stopPropagation()">
-                          <button onclick="handleCopy('\${newImage.key}', 'url')">URL</button>
-                          <button onclick="handleCopy('\${newImage.key}', 'html')">HTML</button>
-                          <button onclick="handleCopy('\${newImage.key}', 'md')">Markdown</button>
-                        </div>
-                      </div>
-                      <button onclick="openEdit('\${newImage.key}')">\${t('edit')}</button>
-                      <button class="btn-danger" onclick="deleteImage('\${newImage.key}')">\${t('del')}</button>
-                    </div>
-                  </div>
-                \`;
-                gallery.prepend(card);
+                renderAppendedBatch([newImage]); // Helper actually appends, but here we want to prepend
+                const newCard = gallery.lastElementChild;
+                gallery.prepend(newCard);
              }
-             // -------------------------------------------------------------------------------------
           }
         }
       } catch(e) { console.error(e); }
@@ -1700,7 +1449,7 @@ function getHTML() {
       if (successCount > 0) {
           showToast(t('toast_uploaded', successCount));
           loadTags();
-          updateStatsUI();
+          loadStats();
       }
     }
 
@@ -1712,13 +1461,12 @@ function getHTML() {
         });
         if (res.ok) {
           fullLibrary = fullLibrary.filter(i => i.key !== key);
-          if(fullIndex) fullIndex = fullIndex.filter(i => i.key !== key); // Update local index cache logic
+          if(fullIndex) fullIndex = fullIndex.filter(i => i.key !== key);
           selectedImages.delete(key);
-          
           showToast(t('toast_deleted'));
           loadTags();
           applyFilters();
-          updateStatsUI();
+          loadStats();
         }
       } catch (e) { showToast(e.message); }
     }
@@ -1732,7 +1480,6 @@ function getHTML() {
         if (!confirm(t('confirm_batch', selectedImages.size))) return;
         
         const keys = Array.from(selectedImages);
-        
         try {
             const res = await fetch('/api/batch-delete', {
                 method: 'POST',
@@ -1742,14 +1489,13 @@ function getHTML() {
             if(res.ok) {
                 const delSet = new Set(keys);
                 fullLibrary = fullLibrary.filter(i => !delSet.has(i.key));
-                if(fullIndex) fullIndex = fullIndex.filter(i => !delSet.has(i.key)); // Update local index cache logic
+                if(fullIndex) fullIndex = fullIndex.filter(i => !delSet.has(i.key));
                 selectedImages.clear();
                 updateSelectionCount();
-                
                 showToast(t('toast_batch_success'));
                 loadTags();
                 applyFilters();
-                updateStatsUI();
+                loadStats();
             }
         } catch(e) { showToast(t('toast_batch_fail')); }
     }
@@ -1757,7 +1503,6 @@ function getHTML() {
     async function saveEdit() {
       const customName = document.getElementById('editCustomName').value.trim();
       const tags = document.getElementById('editTags').value.trim();
-      
       try {
         const res = await fetch('/api/rename', {
           method: 'POST',
@@ -1765,12 +1510,15 @@ function getHTML() {
           body: JSON.stringify({ filename: currentEditKey, customName, tags })
         });
         if (res.ok) {
-           const item = fullLibrary.find(i => i.key === currentEditKey);
-           if (item) {
-               item.customName = customName;
-               item.tags = tags;
-               item._searchStr = (item.customName + ' ' + item.originalName + ' ' + item.tags).toLowerCase();
-           }
+           [fullLibrary, fullIndex].forEach(list => {
+              if(!list) return;
+              const item = list.find(i => i.key === currentEditKey);
+              if (item) {
+                  item.customName = customName;
+                  item.tags = tags;
+                  item._searchStr = (item.customName + ' ' + item.originalName + ' ' + item.tags).toLowerCase();
+              }
+           });
            closeEditModal();
            showToast(t('toast_saved'));
            loadTags();
@@ -1793,8 +1541,7 @@ function getHTML() {
       } else {
         document.getElementById('bulkActions').classList.add('show');
       }
-      document.getElementById('gallery').innerHTML = '';
-      renderAppendedBatch(fullLibrary);
+      applyFilters();
     }
 
     function toggleSelect(key) {
@@ -1804,21 +1551,24 @@ function getHTML() {
     }
      
     function selectAll() {
-      fullLibrary.forEach(img => selectedImages.add(img.key));
+      const currentList = filteredResults.length > 0 ? filteredResults : fullLibrary;
+      currentList.forEach(img => selectedImages.add(img.key));
       updateSelectionCount();
-      document.getElementById('gallery').innerHTML = '';
-      renderAppendedBatch(fullLibrary);
+      const gallery = document.getElementById('gallery');
+      Array.from(gallery.querySelectorAll('.image-card')).forEach(card => card.classList.add('selected'));
+      Array.from(gallery.querySelectorAll('.checkbox')).forEach(cb => cb.checked = true);
     }
      
     function deselectAll() {
       selectedImages.clear();
       updateSelectionCount();
-      document.getElementById('gallery').innerHTML = '';
-      renderAppendedBatch(fullLibrary);
+      const gallery = document.getElementById('gallery');
+      Array.from(gallery.querySelectorAll('.image-card')).forEach(card => card.classList.remove('selected'));
+      Array.from(gallery.querySelectorAll('.checkbox')).forEach(cb => cb.checked = false);
     }
 
     function openEdit(key) {
-      const img = fullLibrary.find(i => i.key === key);
+      const img = fullLibrary.find(i => i.key === key) || (fullIndex && fullIndex.find(i => i.key === key));
       if (!img) return;
       currentEditKey = key;
       document.getElementById('editCustomName').value = img.customName || '';
@@ -1829,20 +1579,22 @@ function getHTML() {
     function closeEditModal() { document.getElementById('editModal').classList.remove('show'); }
      
     function openLightbox(key) {
-      lightboxIndex = fullLibrary.findIndex(i => i.key === key);
+      const list = filteredResults.length > 0 ? filteredResults : fullLibrary;
+      lightboxIndex = list.findIndex(i => i.key === key);
       if (lightboxIndex < 0) return;
       updateLightbox();
       document.getElementById('lightbox').classList.add('show');
     }
     function updateLightbox() {
-      const img = fullLibrary[lightboxIndex];
+      const list = filteredResults.length > 0 ? filteredResults : fullLibrary;
+      const img = list[lightboxIndex];
       if (!img) return;
       const el = document.getElementById('lightboxImg');
-      el.src = img.url;
+      el.src = img.url || \`\${location.origin}/img/\${img.key}\`;
       el.alt = img.customName || img.originalName;
     }
     function prevImage(e) { e && e.stopPropagation(); if (lightboxIndex > 0) { lightboxIndex--; updateLightbox(); } }
-    function nextImage(e) { e && e.stopPropagation(); if (lightboxIndex < fullLibrary.length - 1) { lightboxIndex++; updateLightbox(); } }
+    function nextImage(e) { e && e.stopPropagation(); const list = filteredResults.length > 0 ? filteredResults : fullLibrary; if (lightboxIndex < list.length - 1) { lightboxIndex++; updateLightbox(); } }
     function closeLightbox() { document.getElementById('lightbox').classList.remove('show'); }
 
     function toggleTagCloud() {
@@ -1892,21 +1644,7 @@ function getHTML() {
 
     document.addEventListener('click', () => document.querySelectorAll('.copy-dropdown.open').forEach(el => el.classList.remove('open')));
      
-    document.getElementById('searchInput').addEventListener('input', () => {
-        // When search input changes, we MUST clear the gallery and re-render only the filtered subset
-        const gallery = document.getElementById('gallery');
-        gallery.innerHTML = '';
-        
-        // Ensure activeTag is null if search is used and tag filter is active
-        if (activeTag && document.getElementById('searchInput').value.toLowerCase().includes(activeTag.toLowerCase())) {
-            // Keep activeTag active if the search is a superset of the tag (e.g. tag is 'cat', search is 'cat funny')
-        } else {
-            // If search input is cleared, re-render based on current tag/sort
-            // If search input is entered, filter against activeTag
-        }
-
-        applyFilters();
-    });
+    document.getElementById('searchInput').addEventListener('input', () => applyFilters());
      
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') { closeEditModal(); closeLightbox(); }

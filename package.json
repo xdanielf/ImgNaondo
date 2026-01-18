@@ -1,0 +1,12 @@
+{
+  "name": "imgnaondo",
+  "version": "1.0.0",
+  "description": "Image hosting on Cloudflare Workers with R2 and D1",
+  "main": "worker.js",
+  "scripts": {
+    "deploy": "node setup.js"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
