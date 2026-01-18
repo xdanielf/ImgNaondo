@@ -129,7 +129,7 @@ PASSWORD = "${password}"
   if (success) {
     console.log('\n\x1b[32m=== Deployment Complete! ===\x1b[0m');
     console.log('1. Your image host is live.');
-    console.log('2. Access Password: ${password}');
+    console.log(`2. Access Password: ${password}`);
     console.log('3. If you have existing images in R2, log in and click the "Sync" button.');
   } else {
     console.log('\n\x1b[31m=== Deployment Failed ===\x1b[0m');

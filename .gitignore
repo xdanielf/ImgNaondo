@@ -3,3 +3,7 @@ node_modules
 wrangler.toml
 .DS_Store
 dist
+*.log
+.env
+.env.*
+package-lock.json
